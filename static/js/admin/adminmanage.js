@@ -9,6 +9,10 @@ document.addEventListener('DOMContentLoaded', function() {
     setupWebSocket();
 });
 
+
+
+
+
 function initializeFilters() {
     const statusFilter = document.getElementById('statusFilter');
     const sortFilter = document.getElementById('sortFilter');

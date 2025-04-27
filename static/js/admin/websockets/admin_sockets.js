@@ -5,6 +5,7 @@ class AdminSocketManager {
     constructor(socketManager) {
         this.socketManager = socketManager;
     }
+    
 
     initialize() {
         if (!this.socketManager) {
@@ -28,6 +29,10 @@ class AdminSocketManager {
         
         if (document.getElementById('audit-logs')) {
             this._initializeAuditLogs();
+        }
+
+        if (document.getElementById('adminmanage') || document.location.href.includes('adminmanage')) {
+            this._initializeAdminManage();
         }
         
         // Initialize announcement handlers
@@ -305,7 +310,186 @@ class AdminSocketManager {
             hour12: true
         });
     }
+
+    _initializeAdminManage() {
+        console.log('Initializing admin management page socket handlers');
+        
+        // Handle dashboard stats updates
+        this.socketManager.on('dashboard_stats_update', (data) => {
+            console.log('Received dashboard stats update:', data);
+            
+            // Update office admin stats
+            if (data.active_office_admins !== undefined) {
+                const activeAdminsElement = document.getElementById('active-admins-count');
+                if (activeAdminsElement) {
+                    activeAdminsElement.textContent = data.active_office_admins;
+                }
+            }
+            
+            if (data.unassigned_admins !== undefined) {
+                const unassignedAdminsElement = document.getElementById('unassigned-admins-count');
+                if (unassignedAdminsElement) {
+                    unassignedAdminsElement.textContent = data.unassigned_admins;
+                }
+            }
+            
+            if (data.total_offices !== undefined) {
+                const totalOfficesElement = document.getElementById('total-offices-count');
+                if (totalOfficesElement) {
+                    totalOfficesElement.textContent = data.total_offices;
+                }
+            }
+            
+            if (data.unassigned_offices !== undefined) {
+                const unassignedOfficesElement = document.getElementById('unassigned-offices-count');
+                if (unassignedOfficesElement) {
+                    unassignedOfficesElement.textContent = data.unassigned_offices;
+                }
+            }
+        });
+        
+        // Handle admin added event
+        this.socketManager.on('admin_added', (data) => {
+            console.log('Admin added:', data);
+            this._updateAdminTable(data, 'add');
+        });
+        
+        // Handle admin updated event
+        this.socketManager.on('admin_updated', (data) => {
+            console.log('Admin updated:', data);
+            this._updateAdminTable(data, 'update');
+        });
+        
+        // Handle admin deleted event
+        this.socketManager.on('admin_deleted', (data) => {
+            console.log('Admin deleted:', data);
+            this._updateAdminTable(data, 'delete');
+        });
+        
+        // Handle office admin removed from office
+        this.socketManager.on('office_admin_removed', (data) => {
+            console.log('Office admin removed:', data);
+            this._updateAdminOfficeAssignment(data.admin_id, null);
+        });
+        
+        // Handle admin password reset
+        this.socketManager.on('admin_password_reset', (data) => {
+            console.log('Admin password reset:', data);
+            this._showNotification(`Password reset successfully for ${data.admin_name}`, 'success');
+        });
     }
+
+    // Add this helper method to update the admin table
+_updateAdminTable(adminData, action) {
+    const adminTable = document.getElementById('admin-table');
+    if (!adminTable) return;
+    
+    const adminTableBody = adminTable.querySelector('tbody') || adminTable;
+    
+    if (action === 'add') {
+        // Create new row for the admin
+        const newRow = document.createElement('tr');
+        newRow.id = `admin-row-${adminData.id}`;
+        newRow.innerHTML = this._generateAdminRowHTML(adminData);
+        adminTableBody.prepend(newRow);
+        
+        // Highlight the new row
+        newRow.classList.add('bg-green-50');
+        setTimeout(() => {
+            newRow.classList.remove('bg-green-50');
+        }, 5000);
+        
+        this._showNotification(`Added new admin: ${adminData.first_name} ${adminData.last_name}`, 'success');
+    } 
+    else if (action === 'update') {
+        // Find existing row
+        const existingRow = document.getElementById(`admin-row-${adminData.id}`);
+        if (existingRow) {
+            existingRow.innerHTML = this._generateAdminRowHTML(adminData);
+            
+            // Highlight the updated row
+            existingRow.classList.add('bg-yellow-50');
+            setTimeout(() => {
+                existingRow.classList.remove('bg-yellow-50');
+            }, 5000);
+            
+            this._showNotification(`Updated admin: ${adminData.first_name} ${adminData.last_name}`, 'success');
+        }
+    }
+    else if (action === 'delete') {
+        // Find and remove the row
+        const existingRow = document.getElementById(`admin-row-${adminData.id}`);
+        if (existingRow) {
+            // Fade out effect
+            existingRow.style.transition = 'opacity 0.5s';
+            existingRow.style.opacity = '0';
+            
+            setTimeout(() => {
+                existingRow.remove();
+            }, 500);
+            
+            this._showNotification(`Deleted admin: ${adminData.name}`, 'success');
+        }
+    }
+}
+
+// Helper to generate admin row HTML
+_generateAdminRowHTML(admin) {
+    return `
+        <td class="px-4 py-2 border">${admin.id}</td>
+        <td class="px-4 py-2 border">
+            <div class="flex items-center">
+                ${admin.profile_pic ? 
+                    `<img src="/static/${admin.profile_pic}" class="w-8 h-8 rounded-full mr-2">` : 
+                    `<div class="w-8 h-8 bg-gray-200 rounded-full mr-2 flex items-center justify-center">
+                        <span class="text-gray-500 text-xs">${admin.first_name[0]}${admin.last_name[0]}</span>
+                    </div>`
+                }
+                <span>${admin.first_name} ${admin.middle_name ? admin.middle_name + ' ' : ''}${admin.last_name}</span>
+            </div>
+        </td>
+        <td class="px-4 py-2 border">${admin.email}</td>
+        <td class="px-4 py-2 border">${admin.office_name || 'Not Assigned'}</td>
+        <td class="px-4 py-2 border">
+            <span class="px-2 py-1 rounded-full ${admin.is_active ? 'bg-green-100 text-green-800' : 'bg-red-100 text-red-800'}">
+                ${admin.is_active ? 'Active' : 'Inactive'}
+            </span>
+        </td>
+        <td class="px-4 py-2 border">
+            <div class="flex space-x-2">
+                <button class="bg-blue-500 text-white px-2 py-1 rounded hover:bg-blue-600" 
+                        onclick="editAdmin(${admin.id})">
+                    Edit
+                </button>
+                <button class="bg-red-500 text-white px-2 py-1 rounded hover:bg-red-600"
+                        onclick="deleteAdmin(${admin.id})">
+                    Delete
+                </button>
+            </div>
+        </td>
+    `;
+}
+
+// Helper to update office assignment display
+_updateAdminOfficeAssignment(adminId, officeName) {
+    const adminRow = document.getElementById(`admin-row-${adminId}`);
+    if (adminRow) {
+        const officeCell = adminRow.querySelector('td:nth-child(4)');
+        if (officeCell) {
+            officeCell.textContent = officeName || 'Not Assigned';
+            
+            // Highlight the cell
+            officeCell.classList.add('bg-yellow-100');
+            setTimeout(() => {
+                officeCell.classList.remove('bg-yellow-100');
+            }, 5000);
+        }
+    }
+}
+
+
+    }
+    
     
     // Export the AdminSocketManager class for usage
     if (typeof module !== 'undefined' && module.exports) {

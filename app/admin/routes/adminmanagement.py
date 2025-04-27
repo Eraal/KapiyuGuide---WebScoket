@@ -112,15 +112,20 @@ def remove_office_admin():
         
         db.session.commit()
         
-        # Emit WebSocket event using the utility function from socketio_utils
-        socketio.emit('admin_office_assignment', {
+        # Get updated stats
+        unassigned_admins = User.query.filter_by(role='office_admin').filter(~User.office_admin.has()).count()
+        
+        # Emit WebSocket event for office assignment removal
+        socketio.emit('office_admin_removed', {
             'admin_id': admin_id,
             'admin_name': f"{admin.first_name} {admin.last_name}",
-            'office_id': None,
-            'office_name': None,
-            'assigned_by': current_user.get_full_name(),
-            'action': 'remove',
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+            'office_id': office_id,
+            'office_name': office.name
+        }, room='super_admin_room')
+        
+        # Update the dashboard stats
+        socketio.emit('dashboard_stats_update', {
+            'unassigned_admins': unassigned_admins
         }, room='super_admin_room')
         
         return jsonify({
@@ -146,9 +151,9 @@ def add_admin():
         password = request.form.get('password')
         confirm_password = request.form.get('confirm_password')
         office_id = request.form.get('office_id')
+        is_active = request.form.get('is_active') == 'true'
         
-        is_active = False
-        
+        # Form validation
         if not first_name:
             return jsonify({'success': False, 'message': 'First name is required'}), 400
         if not last_name:
@@ -165,6 +170,7 @@ def add_admin():
         if existing_user:
             return jsonify({'success': False, 'message': 'Email already exists'}), 400
         
+        # Process profile picture if uploaded
         profile_pic_path = None
         if 'profile_pic' in request.files:
             profile_pic = request.files['profile_pic']
@@ -177,6 +183,7 @@ def add_admin():
                 profile_pic_path = os.path.join('uploads/profiles', filename)
                 profile_pic.save(os.path.join(current_app.root_path, 'static', profile_pic_path))
         
+        # Create the new admin user
         new_user = User(
             first_name=first_name,
             middle_name=middle_name,
@@ -189,8 +196,9 @@ def add_admin():
         )
         
         db.session.add(new_user)
-        db.session.flush()
+        db.session.flush()  # Flush to get the new user ID before committing
         
+        # Associate with office if specified
         office_name = None
         if office_id and office_id != '':
             office = Office.query.get(office_id)
@@ -212,38 +220,39 @@ def add_admin():
         
         db.session.commit()
         
+        # Get updated stats to reflect the new admin
         total_offices = Office.query.count()
         active_office_admins = User.query.filter_by(role='office_admin', is_active=True).count()
         unassigned_offices = Office.query.filter(~Office.office_admins.any()).count()
         unassigned_admins = User.query.filter_by(role='office_admin').filter(~User.office_admin.has()).count()
         
-        # Emit WebSocket event for new user creation
-        socketio.emit('user_created', {
-            'user_id': new_user.id,
-            'name': f"{new_user.first_name} {new_user.last_name}",
-            'email': new_user.email,
-            'role': 'office_admin',
-            'created_by': current_user.get_full_name(),
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        # Emit stats update via WebSocket
+        socketio.emit('dashboard_stats_update', {
+            'total_offices': total_offices,
+            'active_office_admins': active_office_admins,
+            'unassigned_offices': unassigned_offices,
+            'unassigned_admins': unassigned_admins
         }, room='super_admin_room')
         
-        # If assigned to an office, emit office assignment event
-        if office_id and office_id != '' and office:
-            socketio.emit('admin_office_assignment', {
-                'admin_id': new_user.id,
-                'admin_name': f"{new_user.first_name} {new_user.last_name}",
-                'office_id': office.id,
-                'office_name': office.name,
-                'assigned_by': current_user.get_full_name(),
-                'action': 'assign',
-                'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            }, room='super_admin_room')
+        # Emit WebSocket event for admin table update
+        socketio.emit('admin_added', {
+            'id': new_user.id,
+            'first_name': new_user.first_name,
+            'middle_name': new_user.middle_name,
+            'last_name': new_user.last_name,
+            'email': new_user.email,
+            'is_active': new_user.is_active,
+            'profile_pic': new_user.profile_pic,
+            'office_id': office_id if office_id and office_id != '' else None,
+            'office_name': office_name
+        }, room='super_admin_room')
         
         return jsonify({'success': True, 'message': 'Office admin added successfully'})
         
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'message': f'Error adding office admin: {str(e)}'}), 500
+
 
 
 @admin_bp.route('/api/admin/<int:admin_id>', methods=['GET'])
@@ -298,6 +307,24 @@ def delete_admin():
             flash('Admin not found', 'error')
             return redirect(url_for('admin.adminmanage'))
         
+        # Get office info before deletion
+        office_admin = OfficeAdmin.query.filter_by(user_id=admin_id).first()
+        office_id = None
+        office_name = None
+        if office_admin:
+            office_id = office_admin.office_id
+            office = Office.query.get(office_id)
+            office_name = office.name if office else None
+            
+        # Store admin info for later use in WebSocket event
+        admin_info = {
+            'id': admin.id,
+            'name': f"{admin.first_name} {admin.last_name}",
+            'email': admin.email,
+            'office_id': office_id,
+            'office_name': office_name
+        }
+        
         # Log action before deletion
         SuperAdminActivityLog.log_action(
             super_admin=current_user,
@@ -309,29 +336,21 @@ def delete_admin():
         db.session.delete(admin)
         db.session.commit()
         
+        # Get updated stats
         total_offices = Office.query.count()
         active_office_admins = User.query.filter_by(role='office_admin', is_active=True).count()
         unassigned_offices = Office.query.filter(~Office.office_admins.any()).count()
         unassigned_admins = User.query.filter_by(role='office_admin').filter(~User.office_admin.has()).count()
         
-        # Emit WebSocket event for user deletion
-        socketio.emit('user_status_changed', {
-            'user_id': admin_id,
-            'name': f"{admin.first_name} {admin.last_name}",
-            'status': 'deleted',
-            'changed_by': current_user.get_full_name(),
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-        }, room='super_admin_room')
+        # Emit WebSocket event for admin deletion
+        socketio.emit('admin_deleted', admin_info, room='super_admin_room')
         
-        # Emit WebSocket event for dashboard update
-        socketio.emit('dashboard_stats', {
-            'active_users': User.query.filter_by(is_active=True).count(),
-            'pending_inquiries': Inquiry.query.filter_by(status='pending').count(),
-            'upcoming_sessions': CounselingSession.query.filter(
-                CounselingSession.scheduled_at > datetime.utcnow(),
-                CounselingSession.status == 'scheduled'
-            ).count(),
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        # Update the dashboard stats
+        socketio.emit('dashboard_stats_update', {
+            'total_offices': total_offices,
+            'active_office_admins': active_office_admins,
+            'unassigned_offices': unassigned_offices,
+            'unassigned_admins': unassigned_admins
         }, room='super_admin_room')
         
         flash('Admin deleted successfully', 'success')
@@ -340,6 +359,7 @@ def delete_admin():
         flash(f'Error deleting admin: {str(e)}', 'error')
     
     return redirect(url_for('admin.adminmanage'))
+
 
 @admin_bp.route('/update_admin', methods=['POST'])
 @login_required
@@ -367,127 +387,120 @@ def update_admin():
         if existing_user:
             return jsonify({'success': False, 'message': 'Email already exists for another user'}), 400
         
-        status_changed = admin.is_active != is_active
-        previous_active_status = admin.is_active
-        
-        # Track changed fields for logging
-        changed_fields = []
-        
+        # Track changes for logging and WebSocket events
+        changes = {}
         if admin.first_name != first_name:
-            changed_fields.append(f"first_name: {admin.first_name} -> {first_name}")
+            changes['first_name'] = {'old': admin.first_name, 'new': first_name}
         if admin.middle_name != middle_name:
-            changed_fields.append(f"middle_name: {admin.middle_name} -> {middle_name}")
+            changes['middle_name'] = {'old': admin.middle_name, 'new': middle_name}
         if admin.last_name != last_name:
-            changed_fields.append(f"last_name: {admin.last_name} -> {last_name}")
+            changes['last_name'] = {'old': admin.last_name, 'new': last_name}
         if admin.email != email:
-            changed_fields.append(f"email: {admin.email} -> {email}")
+            changes['email'] = {'old': admin.email, 'new': email}
         if admin.is_active != is_active:
-            changed_fields.append(f"is_active: {admin.is_active} -> {is_active}")
+            changes['is_active'] = {'old': admin.is_active, 'new': is_active}
         
+        # Process profile picture if uploaded
         if 'profile_pic' in request.files:
             profile_pic = request.files['profile_pic']
             if profile_pic and profile_pic.filename != '':
                 filename = secure_filename(profile_pic.filename)
-
                 upload_folder = os.path.join(current_app.root_path, 'static/uploads/profiles')
                 if not os.path.exists(upload_folder):
                     os.makedirs(upload_folder)
                 
                 profile_pic_path = os.path.join('uploads/profiles', filename).replace("\\", "/")
                 profile_pic.save(os.path.join(current_app.root_path, 'static', profile_pic_path))
-
+                
+                changes['profile_pic'] = {'old': admin.profile_pic, 'new': profile_pic_path}
                 admin.profile_pic = profile_pic_path
-                changed_fields.append("profile_pic: updated")
         
+        # Update basic user info
         admin.first_name = first_name
         admin.middle_name = middle_name
         admin.last_name = last_name
         admin.email = email
         admin.is_active = is_active
         
-        office_changed = False
-        new_office = None
-        old_office = None
+        # Handle office assignment
+        old_office_id = None
+        old_office_name = None
+        new_office_name = None
         
-        if office_id:
-            existing_office_admin = OfficeAdmin.query.filter_by(user_id=admin_id).first()
+        # Check if admin already has an office assignment
+        existing_office_admin = OfficeAdmin.query.filter_by(user_id=admin_id).first()
+        
+        if office_id and office_id != '':
+            new_office = Office.query.get(int(office_id))
+            new_office_name = new_office.name if new_office else None
             
             if existing_office_admin:
-                old_office = Office.query.get(existing_office_admin.office_id)
-                if existing_office_admin.office_id != int(office_id):
-                    office_changed = True
-                    changed_fields.append(f"office_id: {existing_office_admin.office_id} -> {office_id}")
-                    
-                existing_office_admin.office_id = int(office_id)
-                new_office = Office.query.get(int(office_id))
+                old_office_id = existing_office_admin.office_id
+                old_office = Office.query.get(old_office_id)
+                old_office_name = old_office.name if old_office else None
+                
+                if old_office_id != int(office_id):
+                    changes['office'] = {'old': old_office_name, 'new': new_office_name}
+                    existing_office_admin.office_id = int(office_id)
             else:
+                changes['office'] = {'old': None, 'new': new_office_name}
                 new_office_admin = OfficeAdmin(
                     user_id=admin_id,
                     office_id=int(office_id)
                 )
                 db.session.add(new_office_admin)
-                office_changed = True
-                changed_fields.append(f"office_id: None -> {office_id}")
-                
-                new_office = Office.query.get(int(office_id))
+        elif existing_office_admin:
+            old_office_id = existing_office_admin.office_id
+            old_office = Office.query.get(old_office_id)
+            old_office_name = old_office.name if old_office else None
+            changes['office'] = {'old': old_office_name, 'new': None}
+            db.session.delete(existing_office_admin)
         
         # Log the update action
-        if changed_fields:
+        if changes:
+            change_details = []
+            for field, value in changes.items():
+                change_details.append(f"{field}: {value['old']} -> {value['new']}")
+            
             SuperAdminActivityLog.log_action(
                 super_admin=current_user,
                 action="Update Office Admin",
                 target_type="user",
-                details=f"Updated office admin {admin.id}: {', '.join(changed_fields)}"
+                details=f"Updated office admin {admin.id}: {', '.join(change_details)}"
             )
         
         db.session.commit()
         
-        # Emit multiple WebSocket events based on what changed
+        # Get updated stats
+        active_office_admins = User.query.filter_by(role='office_admin', is_active=True).count()
+        unassigned_admins = User.query.filter_by(role='office_admin').filter(~User.office_admin.has()).count()
         
-        # If status changed
-        if status_changed:
-            socketio.emit('user_status_changed', {
-                'user_id': admin_id,
-                'name': f"{admin.first_name} {admin.last_name}",
-                'status': 'active' if is_active else 'inactive',
-                'changed_by': current_user.get_full_name(),
-                'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            }, room='super_admin_room')
+        # Send a single comprehensive update event
+        socketio.emit('admin_updated', {
+            'id': admin.id,
+            'first_name': admin.first_name,
+            'middle_name': admin.middle_name,
+            'last_name': admin.last_name,
+            'email': admin.email,
+            'is_active': admin.is_active,
+            'profile_pic': admin.profile_pic,
+            'office_id': office_id if office_id and office_id != '' else None,
+            'office_name': new_office_name,
+            'changes': changes
+        }, room='super_admin_room')
         
-        # If any user field updated
-        if changed_fields:
-            for field in changed_fields:
-                if field.startswith("first_name") or field.startswith("last_name") or field.startswith("email"):
-                    field_name = field.split(":")[0].strip()
-                    new_value = field.split("->")[1].strip()
-                    
-                    socketio.emit('user_updated', {
-                        'user_id': admin_id,
-                        'name': f"{admin.first_name} {admin.last_name}",
-                        'field_updated': field_name,
-                        'new_value': new_value,
-                        'updated_by': current_user.get_full_name(),
-                        'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-                    }, room='super_admin_room')
+        # Update the dashboard stats
+        socketio.emit('dashboard_stats_update', {
+            'active_office_admins': active_office_admins,
+            'unassigned_admins': unassigned_admins
+        }, room='super_admin_room')
         
-        # If office changed
-        if office_changed and new_office:
-            socketio.emit('admin_office_assignment', {
-                'admin_id': admin_id,
-                'admin_name': f"{admin.first_name} {admin.last_name}",
-                'office_id': new_office.id,
-                'office_name': new_office.name,
-                'old_office_name': old_office.name if old_office else None,
-                'assigned_by': current_user.get_full_name(),
-                'action': 'reassign' if old_office else 'assign',
-                'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
-            }, room='super_admin_room')
-
         return jsonify({'success': True, 'message': 'Admin updated successfully'})
         
     except Exception as e:
         db.session.rollback()
         return jsonify({'success': False, 'message': f'Error updating admin: {str(e)}'}), 500
+
     
 @admin_bp.route('/reset_admin_password', methods=['POST'])
 @login_required
@@ -505,8 +518,8 @@ def reset_admin_password():
         if not admin:
             return jsonify({'success': False, 'message': 'Admin not found'}), 404
         
-        # Generate a random password
-        default_password = ''.join(random.choices('0123456789', k=4))
+        # Reset to a simple default password
+        default_password = 'kapiyuadmin'  # Or generate a random one as in your original code
         
         admin.password_hash = generate_password_hash(default_password)
         
@@ -520,21 +533,15 @@ def reset_admin_password():
         
         db.session.commit()
         
-        # Emit WebSocket event
-        socketio.emit('super_admin_action', {
-            'admin_id': current_user.id,
-            'admin_name': current_user.get_full_name(),
-            'action': "Reset Admin Password",
-            'target_type': "user",
-            'target_id': admin.id,
-            'details': f"Reset password for {admin.first_name} {admin.last_name}",
-            'timestamp': datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S')
+        # Emit WebSocket event for password reset
+        socketio.emit('admin_password_reset', {
+            'admin_id': admin_id,
+            'admin_name': f"{admin.first_name} {admin.last_name}"
         }, room='super_admin_room')
         
         return jsonify({
             'success': True, 
-            'message': 'Password reset successfully', 
-            'password': default_password
+            'message': 'Password has been reset to default (kapiyuadmin)'
         })
         
     except Exception as e:
